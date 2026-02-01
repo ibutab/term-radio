@@ -1,25 +1,66 @@
 #!/usr/bin/env python3
-import json
 import sys
+
+# Prevent macOS Dock icon before any other imports
+if sys.platform == "darwin":
+    try:
+        import ctypes
+        import ctypes.util
+        appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library("AppKit"))
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.objc_msgSend.restype = ctypes.c_void_p
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        NSApp = objc.objc_msgSend(
+            objc.objc_getClass(b"NSApplication"),
+            objc.sel_registerName(b"sharedApplication")
+        )
+        objc.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+        objc.objc_msgSend(NSApp, objc.sel_registerName(b"setActivationPolicy:"), 2)
+    except Exception:
+        pass
+
+import json
 import threading
 import time
 from pathlib import Path
 
-import requests
-import vlc
-from rich.console import Console
-from rich.layout import Layout
-from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
+# Lazy imports for faster startup
+mpv = None
+requests = None
+Console = Layout = Live = Panel = Table = Text = None
+
+def _init_rich():
+    global Console, Layout, Live, Panel, Table, Text
+    if Console is None:
+        from rich.console import Console as C
+        from rich.layout import Layout as L
+        from rich.live import Live as Li
+        from rich.panel import Panel as P
+        from rich.table import Table as T
+        from rich.text import Text as Tx
+        Console, Layout, Live, Panel, Table, Text = C, L, Li, P, T, Tx
+
+def _init_mpv():
+    global mpv
+    if mpv is None:
+        import mpv as m
+        mpv = m
 
 ACCENT = "orange1"
 DIM = "dim"
 MAX_VISIBLE_CHANNELS = 8
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-console = Console()
+console = None
+
+def _get_console():
+    global console
+    if console is None:
+        _init_rich()
+        console = Console()
+    return console
 
 
 class Channel:
@@ -49,46 +90,34 @@ class ChannelManager:
 
 class RadioPlayer:
     def __init__(self):
-        self.instance = None
-        self.player = None
+        self.player: mpv.MPV | None = None
         self.volume = 80
         self.current_channel: Channel | None = None
         self.is_playing = False
         self.is_loading = False
-        self._pending_channel: Channel | None = None
-        self._init_thread: threading.Thread | None = None
-
-    def _init_vlc(self):
-        self.instance = vlc.Instance("--intf", "dummy", "--quiet", "--no-video", "--no-xlib")
-        self.player = self.instance.media_player_new()
-        self.player.audio_set_volume(self.volume)
-        if self._pending_channel:
-            self._play_internal(self._pending_channel)
-            self._pending_channel = None
-        self.is_loading = False
 
     def _ensure_initialized(self):
-        if self.instance is None and self._init_thread is None:
-            self.is_loading = True
-            self._init_thread = threading.Thread(target=self._init_vlc, daemon=True)
-            self._init_thread.start()
-
-    def _play_internal(self, channel: Channel):
-        self.player.stop()
-        self.current_channel = channel
-        media = self.instance.media_new(channel.url)
-        self.player.set_media(media)
-        self.player.play()
-        self.player.audio_set_volume(self.volume)
-        self.is_playing = True
+        if self.player is None:
+            _init_mpv()
+            self.player = mpv.MPV(
+                video=False,
+                terminal=False,
+                input_default_bindings=False,
+                input_vo_keyboard=False,
+                vo="null",
+                ao="coreaudio",
+                macos_app_activation_policy="prohibited",
+            )
+            self.player.volume = self.volume
 
     def play(self, channel: Channel):
         self._ensure_initialized()
-        if self.instance is None:
-            self._pending_channel = channel
-            self.current_channel = channel
-            return
-        self._play_internal(channel)
+        self.is_loading = True
+        self.current_channel = channel
+        self.player.play(channel.url)
+        self.player.volume = self.volume
+        self.is_playing = True
+        self.is_loading = False
 
     def stop(self):
         if self.player:
@@ -98,17 +127,13 @@ class RadioPlayer:
     def toggle_pause(self):
         if not self.player:
             return
-        if self.is_playing:
-            self.player.pause()
-            self.is_playing = False
-        else:
-            self.player.play()
-            self.is_playing = True
+        self.player.pause = not self.player.pause
+        self.is_playing = not self.player.pause
 
     def set_volume(self, vol: int):
         self.volume = max(0, min(100, vol))
         if self.player:
-            self.player.audio_set_volume(self.volume)
+            self.player.volume = self.volume
 
 
 class MetadataFetcher:
@@ -134,6 +159,10 @@ class MetadataFetcher:
             time.sleep(10)
 
     def _fetch_metadata(self, channel: Channel):
+        global requests
+        if requests is None:
+            import requests as r
+            requests = r
         if not channel.status_url:
             self._fetch_icy_metadata(channel)
             return
@@ -201,6 +230,7 @@ class MetadataFetcher:
 
 class TerminalRadio:
     def __init__(self):
+        _init_rich()
         config_path = Path(__file__).parent / "channels.json"
         self.channel_manager = ChannelManager(config_path)
         self.player = RadioPlayer()
@@ -364,7 +394,7 @@ class TerminalRadio:
 
     def run(self):
         if not self.channel_manager.channels:
-            console.print("[red]No channels found in channels.json[/red]")
+            _get_console().print("[red]No channels found in channels.json[/red]")
             return
 
         import select
@@ -377,7 +407,7 @@ class TerminalRadio:
         try:
             tty.setcbreak(fd)
             
-            with Live(self.build_display(), refresh_per_second=4, console=console, screen=True) as live:
+            with Live(self.build_display(), refresh_per_second=4, console=_get_console(), screen=True) as live:
                 self.select_channel(0)
                 
                 while self.running:
@@ -404,11 +434,11 @@ class TerminalRadio:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
             self.metadata.stop()
             self.player.stop()
-            console.print(f"\n[{ACCENT}]Thanks for listening![/{ACCENT}]")
+            _get_console().print(f"\n[{ACCENT}]Thanks for listening![/{ACCENT}]")
 
 
 def main():
-    console.clear()
+    _get_console().clear()
     app = TerminalRadio()
     app.run()
 

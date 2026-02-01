@@ -5,6 +5,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "Installing Terminal Radio..."
 
+# Check for mpv
+if ! command -v mpv &> /dev/null; then
+    echo "mpv not found. Installing..."
+    if command -v brew &> /dev/null; then
+        brew install mpv
+    elif command -v apt-get &> /dev/null; then
+        sudo apt-get update && sudo apt-get install -y mpv
+    else
+        echo "Error: Could not install mpv. Please install it manually."
+        exit 1
+    fi
+fi
+
 # Create virtual environment
 echo "Creating virtual environment..."
 python3 -m venv "$SCRIPT_DIR/.venv"
@@ -20,7 +33,9 @@ mkdir -p "$HOME/bin"
 cat > "$HOME/bin/radio" << EOF
 #!/bin/bash
 cd "$SCRIPT_DIR"
-.venv/bin/python radio.py "\$@"
+export PYGAME_HIDE_SUPPORT_PROMPT=1
+export SDL_VIDEODRIVER=dummy
+exec .venv/bin/python -O radio.py "\$@"
 EOF
 chmod +x "$HOME/bin/radio"
 
@@ -41,6 +56,9 @@ if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
         echo "Run 'source $SHELL_RC' or restart your terminal."
     fi
 fi
+
+# Pre-compile bytecode for faster subsequent starts
+"$SCRIPT_DIR/.venv/bin/python" -m compileall -q "$SCRIPT_DIR"
 
 echo ""
 echo "Installation complete!"

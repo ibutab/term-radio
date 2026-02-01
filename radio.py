@@ -17,6 +17,7 @@ from rich.text import Text
 ACCENT = "orange1"
 DIM = "dim"
 MAX_VISIBLE_CHANNELS = 8
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 console = Console()
 
@@ -48,14 +49,31 @@ class ChannelManager:
 
 class RadioPlayer:
     def __init__(self):
-        self.instance = vlc.Instance("--intf", "dummy", "--quiet")
-        self.player = self.instance.media_player_new()
+        self.instance = None
+        self.player = None
         self.volume = 80
-        self.player.audio_set_volume(self.volume)
         self.current_channel: Channel | None = None
         self.is_playing = False
+        self.is_loading = False
+        self._pending_channel: Channel | None = None
+        self._init_thread: threading.Thread | None = None
 
-    def play(self, channel: Channel):
+    def _init_vlc(self):
+        self.instance = vlc.Instance("--intf", "dummy", "--quiet", "--no-video", "--no-xlib")
+        self.player = self.instance.media_player_new()
+        self.player.audio_set_volume(self.volume)
+        if self._pending_channel:
+            self._play_internal(self._pending_channel)
+            self._pending_channel = None
+        self.is_loading = False
+
+    def _ensure_initialized(self):
+        if self.instance is None and self._init_thread is None:
+            self.is_loading = True
+            self._init_thread = threading.Thread(target=self._init_vlc, daemon=True)
+            self._init_thread.start()
+
+    def _play_internal(self, channel: Channel):
         self.player.stop()
         self.current_channel = channel
         media = self.instance.media_new(channel.url)
@@ -64,11 +82,22 @@ class RadioPlayer:
         self.player.audio_set_volume(self.volume)
         self.is_playing = True
 
+    def play(self, channel: Channel):
+        self._ensure_initialized()
+        if self.instance is None:
+            self._pending_channel = channel
+            self.current_channel = channel
+            return
+        self._play_internal(channel)
+
     def stop(self):
-        self.player.stop()
+        if self.player:
+            self.player.stop()
         self.is_playing = False
 
     def toggle_pause(self):
+        if not self.player:
+            return
         if self.is_playing:
             self.player.pause()
             self.is_playing = False
@@ -78,7 +107,8 @@ class RadioPlayer:
 
     def set_volume(self, vol: int):
         self.volume = max(0, min(100, vol))
-        self.player.audio_set_volume(self.volume)
+        if self.player:
+            self.player.audio_set_volume(self.volume)
 
 
 class MetadataFetcher:
@@ -177,6 +207,7 @@ class TerminalRadio:
         self.metadata = MetadataFetcher()
         self.current_index = 0
         self.running = True
+        self.spinner_frame = 0
 
     def get_logo(self) -> str:
         return """ ████████╗ ███████╗ ██████╗  ███╗   ███╗
@@ -245,16 +276,24 @@ class TerminalRadio:
         now_playing = self.metadata.now_playing or "..."
         listeners = self.metadata.listeners
         channel_name = self.channel_manager.channels[self.current_index].name if self.channel_manager.channels else ""
-        status_icon = "▶" if self.player.is_playing else "⏸"
         vol_bar = "█" * (self.player.volume // 10) + "░" * (10 - self.player.volume // 10)
         
         np_text = Text()
-        np_text.append(f" {status_icon} ", style=ACCENT if self.player.is_playing else DIM)
-        np_text.append(f"{channel_name}", style=f"bold {ACCENT}")
-        if listeners > 0:
-            np_text.append(f" ({listeners})", style=DIM)
-        np_text.append(f"  {vol_bar} {self.player.volume}%\n", style=DIM)
-        np_text.append(f"   {now_playing}", style="")
+        if self.player.is_loading:
+            spinner = SPINNER_FRAMES[self.spinner_frame % len(SPINNER_FRAMES)]
+            self.spinner_frame += 1
+            np_text.append(f" {spinner} ", style=ACCENT)
+            np_text.append(f"{channel_name}", style=f"bold {ACCENT}")
+            np_text.append(f"  {vol_bar} {self.player.volume}%\n", style=DIM)
+            np_text.append(f"   Loading...", style=DIM)
+        else:
+            status_icon = "▶" if self.player.is_playing else "⏸"
+            np_text.append(f" {status_icon} ", style=ACCENT if self.player.is_playing else DIM)
+            np_text.append(f"{channel_name}", style=f"bold {ACCENT}")
+            if listeners > 0:
+                np_text.append(f" ({listeners})", style=DIM)
+            np_text.append(f"  {vol_bar} {self.player.volume}%\n", style=DIM)
+            np_text.append(f"   {now_playing}", style="")
 
         layout["now_playing"].update(Panel(
             np_text,
@@ -265,9 +304,7 @@ class TerminalRadio:
 
         controls = Text()
         controls.append("  [w/s]", style=ACCENT)
-        controls.append(" Nav  ", style=DIM)
-        controls.append("[Enter]", style=ACCENT)
-        controls.append(" Play  ", style=DIM)
+        controls.append(" Channel  ", style=DIM)
         controls.append("[Space]", style=ACCENT)
         controls.append(" Pause  ", style=DIM)
         controls.append("[a/d]", style=ACCENT)
@@ -304,13 +341,9 @@ class TerminalRadio:
             self.running = False
         elif key == " ":
             self.player.toggle_pause()
-        elif key in ("s", "j"):
-            self.move_selection(1)
-        elif key in ("w", "k"):
-            self.move_selection(-1)
-        elif key == "n":
+        elif key in ("s", "j", "n"):
             self.next_channel()
-        elif key == "p":
+        elif key in ("w", "k", "p"):
             self.prev_channel()
         elif key in ("\r", "\n"):
             self.select_channel(self.current_index)
